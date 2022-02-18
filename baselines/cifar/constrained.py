@@ -37,6 +37,8 @@ import wandb
 
 
 flags.DEFINE_float('label_smoothing', 0., 'Label smoothing parameter in [0,1].')
+flags.DEFINE_float('min_entropy', 0.6, 'Minimum entropy constraint.')
+flags.DEFINE_float('dual_lr', 0.1, 'Dual Learning Rate.')
 flags.register_validator('label_smoothing',
                          lambda ls: ls >= 0.0 and ls <= 1.0,
                          message='--label_smoothing must be in [0, 1].')
@@ -84,11 +86,10 @@ flags.DEFINE_bool('eval_on_ood', False,
                   'Whether to run OOD evaluation on specified OOD datasets.')
 flags.DEFINE_list('ood_dataset', 'cifar100,svhn_cropped',
                   'list of OOD datasets to evaluate on.')
-flags.DEFINE_string('saved_model_dir', None,
+flags.DEFINE_string('saved_model_dir', './saved_models',
                     'Directory containing the saved model checkpoints.')
 flags.DEFINE_bool('dempster_shafer_ood', False,
                   'Wheter to use DempsterShafer Uncertainty score.')
-
 
 FLAGS = flags.FLAGS
 
@@ -135,8 +136,7 @@ def main(argv):
   formatter = logging.PythonFormatter(fmt)
   logging.get_absl_handler().setFormatter(formatter)
   del argv  # unused arg
-  wandb.init(project="uncertainty",name="baseline", config=FLAGS, sync_tensorboard=True)
-
+  wandb.init(project="uncertainty",name="constrained", config=FLAGS, sync_tensorboard=True)
   tf.io.gfile.makedirs(FLAGS.output_dir)
   logging.info('Saving checkpoints at %s', FLAGS.output_dir)
   tf.random.set_seed(FLAGS.seed)
@@ -277,6 +277,10 @@ def main(argv):
     metrics = {
         'train/negative_log_likelihood':
             tf.keras.metrics.Mean(),
+        'train/dual_var':
+            tf.keras.metrics.Mean(),
+        'train/entropy':
+            tf.keras.metrics.Mean(),
         'train/accuracy':
             tf.keras.metrics.SparseCategoricalAccuracy(),
         'train/loss':
@@ -284,6 +288,8 @@ def main(argv):
         'train/ece':
             rm.metrics.ExpectedCalibrationError(num_bins=FLAGS.num_bins),
         'test/negative_log_likelihood':
+            tf.keras.metrics.Mean(),
+        'test/entropy':
             tf.keras.metrics.Mean(),
         'test/accuracy':
             tf.keras.metrics.SparseCategoricalAccuracy(),
@@ -329,11 +335,22 @@ def main(argv):
       logging.info('Loaded checkpoint %s', latest_checkpoint)
     if FLAGS.eval_only:
       initial_epoch = FLAGS.train_epochs - 1  # Run just one epoch of eval
+  
+  @tf.function
+  def eval_constraint(logits, min_entropy):
+    return -tf.math.reduce_mean(entropy(logits)) + min_entropy
 
   @tf.function
-  def train_step(iterator):
+  def entropy(logits):
+    probs = tf.nn.softmax(logits, axis=1)
+    entropy = -probs * tf.math.log(probs + 1e-8)  # sum 1e-8 to avoid log(0)
+    entropy = tf.math.reduce_sum(entropy, axis=-1)
+    return entropy
+
+  @tf.function
+  def train_step(iterator, dual_var):
     """Training StepFn."""
-    def step_fn(inputs):
+    def step_fn(inputs, dual_var):
       """Per-Replica StepFn."""
       images = inputs['features']
       labels = inputs['labels']
@@ -358,22 +375,32 @@ def main(argv):
                   from_logits=True,
                   label_smoothing=FLAGS.label_smoothing))
         l2_loss = sum(model.losses)
-        loss = negative_log_likelihood + l2_loss
+        slack = eval_constraint(logits, FLAGS.min_entropy)
+        loss = negative_log_likelihood + l2_loss + dual_var * slack
+        ##################
+        # Update Lambda
+        ##################
+        updated_dual_var =  tf.stop_gradient(dual_var) + FLAGS.dual_lr * tf.stop_gradient(slack)
+        if updated_dual_var<0:
+          updated_dual_var = 0.0
+        ##################
         # Scale the loss given the TPUStrategy will reduce sum all gradients.
         scaled_loss = loss / strategy.num_replicas_in_sync
-
       grads = tape.gradient(scaled_loss, model.trainable_variables)
       optimizer.apply_gradients(zip(grads, model.trainable_variables))
-
       probs = tf.nn.softmax(logits)
       metrics['train/ece'].add_batch(probs, label=labels)
+      metrics['train/entropy'].update_state(tf.math.reduce_mean(entropy(logits)))
       metrics['train/loss'].update_state(loss)
+      metrics['train/dual_var'].update_state(updated_dual_var)
       metrics['train/negative_log_likelihood'].update_state(
           negative_log_likelihood)
       metrics['train/accuracy'].update_state(labels, logits)
+      return updated_dual_var
 
     for _ in tf.range(tf.cast(steps_per_epoch, tf.int32)):
-      strategy.run(step_fn, args=(next(iterator),))
+      dual_var = strategy.run(step_fn, args=(next(iterator),dual_var))
+    return dual_var
 
   @tf.function
   def test_step(iterator, dataset_split, dataset_name, num_steps):
@@ -393,6 +420,7 @@ def main(argv):
             negative_log_likelihood)
         metrics[f'{dataset_split}/accuracy'].update_state(labels, probs)
         metrics[f'{dataset_split}/ece'].add_batch(probs, label=labels)
+        metrics[f'{dataset_split}/entropy'].update_state(tf.math.reduce_mean(entropy(logits)))
       elif dataset_name.startswith('ood/'):
         ood_labels = 1 - inputs['is_in_distribution']
         if FLAGS.dempster_shafer_ood:
@@ -454,13 +482,14 @@ def main(argv):
         profile_batch=(100, 102),
         log_dir=os.path.join(FLAGS.output_dir, 'logs'))
     tb_callback.set_model(model)
+  dual_var = 0.0
   for epoch in range(initial_epoch, FLAGS.train_epochs):
     logging.info('Starting to run epoch: %s', epoch)
     if tb_callback:
       tb_callback.on_epoch_begin(epoch)
     if not FLAGS.eval_only:
       train_start_time = time.time()
-      train_step(train_iterator)
+      dual_var = train_step(train_iterator, dual_var)
       ms_per_example = (time.time() - train_start_time) * 1e6 / batch_size
       metrics['train/ms_per_example'].update_state(ms_per_example)
 
