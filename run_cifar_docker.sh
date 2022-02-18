@@ -1,0 +1,1 @@
+./run_exps_docker.sh ./cifar_exp.sh
